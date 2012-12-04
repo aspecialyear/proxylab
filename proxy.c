@@ -56,7 +56,7 @@ int testserve(int argc, char **argv)
   listenfd = Open_listenfd(port);
   while(1)
   {
-    printf("Listening...\n");
+    printf("Listening on port:%d...\n", port);
     clientlen = sizeof(clientaddr);
     connfd = Accept(listenfd, (SA *)&clientaddr,
       (unsigned int *) (&clientlen));
@@ -86,76 +86,95 @@ int main(int argc, char **argv)
   return 0;
 }
 
-void processRequest(int fd)
+void processRequest(int clientfd)
 {
   char buf[MAXLINE], headerName[MAXLINE], headerContent[MAXLINE];
   struct parsed_request rmtaddr;
-  int parseStatus;
-  int rfd;
+  int parseStatus, bodyFlag;
+  int serverfd;
   rio_t rio;
 
-  dbg_printf("======Beginning of log request processing...\n");
+  dbg_printf("======Beginning of request processing...\n");
   /* Read the method, URI, version */
-  Rio_readinitb(&rio, fd);
+  Rio_readinitb(&rio, clientfd);
   Rio_readlineb(&rio, buf, MAXLINE); // ok this step removed buffer overflow
 
   /* Parse the fist line of request header */
   parseStatus = parse_first_line(buf, &rmtaddr);
   if ( parseStatus != 1)
   {
-    clienterror(fd, buf, "501", "Input Format Error",
+    clienterror(clientfd, buf, "501", "Input Format Error",
               "Error in the request URI format.");
     return;
   }
-  dbg_printf("%s:%s:%d\n",
+  dbg_printf("Remote name parsed:%s\nPath parsed:%s\nPortnumber:%d\n",
       rmtaddr.hostName, rmtaddr.path, rmtaddr.port);
   // Re-make the header sent to the remote
   // I'd like to make the
-  rfd = Popen_clientfd(rmtaddr.hostName, rmtaddr.port);
-  if (rfd < 0)
+  serverfd = Popen_clientfd(rmtaddr.hostName, rmtaddr.port);
+  if (serverfd < 0)
   {
-    if (rfd == -1)
-      clienterror(fd, rmtaddr.uri, "500", "Internal Error",
+    if (serverfd == -1)
+      clienterror(clientfd, rmtaddr.uri, "500", "Internal Error",
               "Proxy can not connect to remote server.");
     else
-      clienterror(fd, rmtaddr.uri, "404", "Not Found",
+      clienterror(clientfd, rmtaddr.uri, "404", "Not Found",
               "Proxy can not find the given remote address.");
     return;
   }
 
-  // TODO test for remote address
-  close(rfd);
-  rfd = STDOUT_FILENO;
-
   // write the headers to the remote server
-  write_req_hrds(rfd, &rmtaddr);
+  write_req_hrds(serverfd, &rmtaddr);
+
   // write the rest of client request
-  while ((Rio_readlineb(&rio, buf, MAXLINE) > 0) && (strcmp(buf, "\r\n") != 0))
+  // by default no body included
+  bodyFlag = 0;
+  while (Rio_readlineb(&rio, buf, MAXLINE) > 0)
   {
     sscanf(buf, "%s %s", headerName, headerContent);
     if (!strcasecmp(headerName, "User-Agent:")
         || !strcasecmp(headerName, "accept:")
             || !strcasecmp(headerName, "accept-encoding:")
-                || !strcasecmp(headerName, "Host: "))
+                || !strcasecmp(headerName, "Host:"))
     {
       continue;
     }
+    if (!strcasecmp(headerName, "content-length: "))
+    {
+      bodyFlag = 1;
+    }
     dbg_printf("outputing request header to remote...\n");
-    Rio_writen(rfd, buf, strlen(buf));
-    printbychar(buf);
+    Rio_writen(serverfd, buf, strlen(buf));
+    if (strcmp(buf, "\r\n") == 0)
+    {
+      break;
+    }
   }
 
   dbg_printf("====== After output the request headers...\n");
+
   // after a blank line,
   // write the rest of body of the client request (if any)
-  dbg_printf("====== Begin output the request body...\n");
+  if (bodyFlag)
+  {
+  dbg_printf("====== Caution: begin output the request body...\n");
   while (Rio_readlineb(&rio, buf, MAXLINE) && !strcmp(buf, "\r\n"))
   {
-    printbychar(buf);
     dbg_printf("outputing request body to remote...\n");
-    Rio_writen(rfd, buf, strlen(buf));
+    Rio_writen(serverfd, buf, strlen(buf));
   }
   dbg_printf("====== End of output request body ... \n");
+  }
+
+  // waiting for the server to return response
+  int bytes = 0;
+  int bytesread = 1;
+  while((bytesread = rio_readn(serverfd, buf, MAXLINE))>0){
+  //go until the stream is empty
+  bytes += bytesread;
+  rio_writen(clientfd,buf,bytesread);
+  }
+  close(serverfd);
   dbg_printf("====== End of request processing ... \n");
 }
 
@@ -198,6 +217,8 @@ void clienterror(int fd, char *cause, char *errnum,
 static int parse_first_line(char *first_line, struct parsed_request *rmtaddr)
 {
   char *uri, *hostBegin, *portNumBegin, *pathBegin;
+  int hostlen, pathlen, portnumlen;
+
   if (sscanf(first_line, "%s %s %s", rmtaddr->method,
       rmtaddr->uri, rmtaddr->version) <= 0)
   {
@@ -222,23 +243,32 @@ static int parse_first_line(char *first_line, struct parsed_request *rmtaddr)
   {
     /* The colon is within the path */
     rmtaddr->port = 80;
-    strncpy(rmtaddr->hostName, hostBegin, (pathBegin - hostBegin));
+    hostlen = (pathBegin - hostBegin);
+    strncpy(rmtaddr->hostName, hostBegin, hostlen);
+    if (hostlen < MAXLINE)
+      (rmtaddr->hostName)[hostlen] = '\0';
   }else {
     /* The colon is there, port number exists, remove the colon as well */
-    strncpy(rmtaddr->hostName, hostBegin, (portNumBegin - hostBegin - 1));
+    hostlen = (portNumBegin - hostBegin - 1);
+    strncpy(rmtaddr->hostName, hostBegin, hostlen);
+    if (hostlen < MAXLINE)
+      (rmtaddr->hostName)[hostlen] = '\0';
 
-    int portNumLen = pathBegin - portNumBegin;
-    char portNumStr[portNumLen];
-    strncpy(portNumStr, portNumBegin, portNumLen);
-
+    portnumlen = pathBegin - portNumBegin;
+    char portNumStr[portnumlen];
+    strncpy(portNumStr, portNumBegin, portnumlen);
     if ((rmtaddr->port = atoi(portNumStr)) == 0)
     {
       /* The port number format is invalid.*/
       return 0;
     }
   }
+
   /* Copy the path */
-  strncpy(rmtaddr->path, pathBegin, strlen(pathBegin));
+  pathlen = strlen(pathBegin);
+  strncpy(rmtaddr->path, pathBegin, pathlen);
+  if (pathlen < MAXLINE)
+    (rmtaddr->path)[pathlen] = '\0';
   return 1;
 }
 

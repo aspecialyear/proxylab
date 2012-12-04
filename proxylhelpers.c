@@ -16,8 +16,6 @@ struct hostent *Pgethostbyname(const char *addr)
     hostp = gethostbyaddr((const char *)&addrp, sizeof(addrp), AF_INET);
   else
     hostp = gethostbyname(addr);
-  V(&mutex);
-  printf("official hostname: %s\n", hostp->h_name);
   return hostp;
 }
 
